@@ -24,7 +24,8 @@
     "storage",
     "cookies",
     "scripting",
-    "tabs"
+    "tabs",
+    "webNavigation"
   ],
   "host_permissions": [
     "<all_urls>"
@@ -38,6 +39,12 @@
       "matches": ["<all_urls>"],
       "js": ["src/content/index.ts"],
       "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["blocked.html"],
+      "matches": ["<all_urls>"]
     }
   ]
 }

@@ -1,14 +1,16 @@
 // ============================================================================
 // SenseAI Extension - Background Service Worker
 // ============================================================================
-// This service worker handles:
-// - Communication between popup, content scripts, and (future) backend
+// Handles:
+// - WebSocket connection to backend
 // - Signal collection orchestration
 // - Analysis result caching
-// - Offline queue management
-// - WebSocket connection to backend (when implemented)
+// - Offline queue management (fallback simulation)
+// - Dark-pattern URL blocking
+// - Extension ↔ Popup ↔ Content script messaging
 // ============================================================================
 
+import { io, Socket } from 'socket.io-client';
 import type {
   AnalysisResult,
   ExtensionMessage,
@@ -22,32 +24,28 @@ import { DEFAULT_SETTINGS } from '../types';
 import { generateId, getDomainFromUrl } from '../lib/utils';
 import { simulateAnalysis, simulateExplanation } from './simulation';
 
+const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:3000';
+const MAX_RECONNECT = 5;
+
 // ============================================================================
-// State Management
+// State
 // ============================================================================
 
 let extensionStatus: ExtensionStatus = {
   isAuthenticated: false,
-  connectionStatus: 'offline', // Start as offline since backend isn't implemented
+  connectionStatus: 'offline',
   pendingAnalyses: 0,
   offlineQueueSize: 0,
 };
 
-// Store for pending signal collections
-const pendingSignalCollections: Map<number, (signals: PageSignals) => void> = new Map();
-
-// ============================================================================
-// WebSocket Connection (COMMENTED - Backend not implemented yet)
-// ============================================================================
-
-/*
-// TODO: Uncomment when backend is ready
-import { io, Socket } from 'socket.io-client';
-
 let socket: Socket | null = null;
-const BACKEND_URL = 'http://localhost:3000';
-const MAX_RECONNECT_ATTEMPTS = 5;
 let reconnectAttempts = 0;
+const pendingSignalCollections = new Map<number, (s: PageSignals) => void>();
+let localBlocklist: Array<{ domain: string; reason: string }> = [];
+
+// ============================================================================
+// WebSocket Connection
+// ============================================================================
 
 function initializeWebSocket(token: string): void {
   if (socket?.connected) return;
@@ -58,7 +56,7 @@ function initializeWebSocket(token: string): void {
     reconnection: true,
     reconnectionDelay: 1000,
     reconnectionDelayMax: 30000,
-    reconnectionAttempts: MAX_RECONNECT_ATTEMPTS,
+    reconnectionAttempts: MAX_RECONNECT,
   });
 
   socket.on('connect', () => {
@@ -69,71 +67,148 @@ function initializeWebSocket(token: string): void {
   });
 
   socket.on('disconnect', (reason) => {
-    console.log('[SenseAI] Disconnected from backend:', reason);
+    console.log('[SenseAI] Disconnected:', reason);
     updateStatus({ connectionStatus: 'disconnected' });
   });
 
-  socket.on('connect_error', (error) => {
-    console.error('[SenseAI] Connection error:', error);
+  socket.on('connect_error', async () => {
     reconnectAttempts++;
-    if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+    // On first failure, try refreshing the access token
+    if (reconnectAttempts === 1) {
+      const newToken = await refreshExtensionToken();
+      if (newToken && socket) {
+        socket.auth = { token: newToken };
+      }
+    }
+    if (reconnectAttempts >= MAX_RECONNECT) {
       updateStatus({ connectionStatus: 'offline' });
     } else {
       updateStatus({ connectionStatus: 'connecting' });
     }
   });
 
-  // Handle analysis results from backend
-  socket.on('analysis:result', (result: AnalysisResult) => {
-    handleAnalysisResult(result);
+  // Receive analysis results from backend
+  socket.on('analysis:result', (data: { session: any }) => {
+    handleBackendResult(data.session);
   });
 
-  // Handle explanation updates (streaming)
-  socket.on('explanation:update', (data: { sessionId: string; text: string; status: string }) => {
-    handleExplanationUpdate(data);
+  // Backend says URL is blocked (dark pattern)
+  socket.on('url:blocked', (data: { blocked: boolean; reason?: string }) => {
+    // Notify popup
+    chrome.runtime.sendMessage({ type: 'URL_BLOCKED', ...data }).catch(() => {});
   });
 
-  // Handle rate limiting
-  socket.on('rate:limited', (data: { retryAfter: number }) => {
-    console.warn('[SenseAI] Rate limited, retry after:', data.retryAfter);
-    // Notify popup about rate limiting
+  // Backend says extension has been unlinked from dashboard
+  socket.on('extension:unlinked', async () => {
+    console.log('[SenseAI] Extension unlinked from dashboard');
+    await clearAuthTokens();
+    updateStatus({ isAuthenticated: false, connectionStatus: 'offline' });
   });
 }
 
 function disconnectWebSocket(): void {
-  if (socket) {
-    socket.disconnect();
-    socket = null;
-  }
-  updateStatus({ connectionStatus: 'disconnected' });
+  if (socket) { socket.disconnect(); socket = null; }
+  updateStatus({ connectionStatus: 'disconnected', isAuthenticated: false });
 }
 
-async function sendToBackend(event: string, data: unknown): Promise<void> {
-  if (!socket?.connected) {
-    // Queue for later if offline
-    await addToOfflineQueue(data as PageSignals);
-    return;
-  }
-  socket.emit(event, data);
+// ============================================================================
+// Backend Analysis
+// ============================================================================
+
+async function handleBackendResult(session: any): Promise<void> {
+  if (!session) return;
+
+  const domain = session.domain || getDomainFromUrl(session.url);
+  // Map backend session to AnalysisResult shape used by popup
+  const mapped: AnalysisResult = {
+    id: session.id,
+    url: session.url,
+    domain,
+    trustScore: session.trust_score ?? session.trustScore ?? 0,
+    verdict: session.verdict || 'warning',
+    signalScores: session.signal_breakdown
+      ? {
+          cookies: session.signal_breakdown.cookies?.score ?? 100,
+          trackers: session.signal_breakdown.trackers?.score ?? 100,
+          fingerprinting: session.signal_breakdown.fingerprinting?.score ?? 100,
+          headers: session.signal_breakdown.headers?.score ?? 100,
+          ssl: session.signal_breakdown.ssl?.score ?? 100,
+        }
+      : { cookies: 100, trackers: 100, fingerprinting: 100, headers: 100, ssl: 100 },
+    signals: { url: session.url, domain, timestamp: session.created_at || new Date().toISOString(), cookies: { count: 0, thirdPartyCount: 0, cookies: [] }, trackers: { detected: [], blocked: 0, scripts: [] }, fingerprinting: { techniques: [], risk: 'low' }, headers: { present: [], missing: [], issues: [] }, ssl: { valid: true } },
+    analyzedAt: session.created_at || new Date().toISOString(),
+    explanation: session.explanation
+      ? { status: 'complete' as const, text: session.explanation.text, generatedAt: session.explanation.generated_at }
+      : { status: 'pending' as const },
+  };
+
+  await setCachedResult(domain, mapped);
+
+  // Notify popup
+  chrome.runtime.sendMessage({ type: 'ANALYSIS_RESULT', result: mapped, fromCache: false }).catch(() => {});
+}
+
+async function sendBehaviorBatch(signals: PageSignals): Promise<any> {
+  return new Promise((resolve, reject) => {
+    if (!socket?.connected) {
+      reject(new Error('Not connected'));
+      return;
+    }
+
+    socket.emit(
+      'behavior:batch',
+      {
+        url: signals.url,
+        timestamp: signals.timestamp,
+        signals: {
+          cookies: signals.cookies,
+          trackers: signals.trackers,
+          fingerprinting: signals.fingerprinting,
+          headers: signals.headers,
+          ssl: signals.ssl,
+        },
+      },
+      (response: any) => {
+        if (response?.type === 'url:blocked') {
+          resolve({ blocked: true, reason: response.reason });
+        } else if (response?.type === 'analysis:result') {
+          resolve(response.session);
+        } else if (response?.type === 'error') {
+          reject(new Error(response.message));
+        } else {
+          resolve(response);
+        }
+      }
+    );
+
+    // Timeout
+    setTimeout(() => reject(new Error('Backend analysis timeout')), 30000);
+  });
+}
+
+async function checkUrlBlocked(url: string): Promise<{ blocked: boolean; reason?: string }> {
+  return new Promise((resolve) => {
+    if (!socket?.connected) {
+      resolve({ blocked: false });
+      return;
+    }
+    socket.emit('url:check', { url }, (resp: any) => resolve(resp || { blocked: false }));
+    setTimeout(() => resolve({ blocked: false }), 5000);
+  });
 }
 
 async function processOfflineQueue(): Promise<void> {
   const queue = await getOfflineQueue();
-  if (queue.length === 0) return;
-
-  console.log(`[SenseAI] Processing ${queue.length} queued items`);
-  
   for (const item of queue) {
-    if (socket?.connected) {
-      socket.emit('analyze:signals', {
-        signals: item.signals,
-        queueId: item.id,
-      });
+    if (!socket?.connected) break;
+    try {
+      await sendBehaviorBatch(item.signals);
       await removeFromOfflineQueue(item.id);
+    } catch {
+      // will retry later
     }
   }
 }
-*/
 
 // ============================================================================
 // Storage Helpers
@@ -244,105 +319,222 @@ function updateStatus(partial: Partial<ExtensionStatus>): void {
 }
 
 // ============================================================================
-// Analysis Handler (Simulation Mode)
+// Auth Helpers
+// ============================================================================
+
+async function getAuthToken(): Promise<string | null> {
+  try {
+    const result = await chrome.storage.local.get('authToken');
+    return (result.authToken as string) || null;
+  } catch { return null; }
+}
+
+async function getRefreshToken(): Promise<string | null> {
+  try {
+    const result = await chrome.storage.local.get('refreshToken');
+    return (result.refreshToken as string) || null;
+  } catch { return null; }
+}
+
+async function setAuthTokens(accessToken: string, refreshToken?: string): Promise<void> {
+  const data: Record<string, string> = { authToken: accessToken };
+  if (refreshToken) data.refreshToken = refreshToken;
+  await chrome.storage.local.set(data);
+  updateStatus({ isAuthenticated: true });
+}
+
+async function clearAuthTokens(): Promise<void> {
+  await chrome.storage.local.remove(['authToken', 'refreshToken']);
+  disconnectWebSocket();
+}
+
+async function refreshExtensionToken(): Promise<string | null> {
+  const refreshToken = await getRefreshToken();
+  if (!refreshToken) return null;
+  try {
+    const resp = await fetch(`${BACKEND_URL}/api/auth/refresh`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ refreshToken }),
+    });
+    if (!resp.ok) {
+      await clearAuthTokens();
+      return null;
+    }
+    const data = await resp.json();
+    await setAuthTokens(data.accessToken, data.refreshToken || refreshToken);
+    return data.accessToken;
+  } catch {
+    return null;
+  }
+}
+
+async function tryConnect(): Promise<void> {
+  let token = await getAuthToken();
+  if (!token) {
+    // Access token missing; try to obtain a new one from refresh token
+    token = await refreshExtensionToken();
+  }
+  if (token) {
+    updateStatus({ isAuthenticated: true, connectionStatus: 'connecting' });
+    initializeWebSocket(token);
+  }
+}
+
+// ============================================================================
+// Blocklist Cache
+// ============================================================================
+
+async function fetchBlocklist(): Promise<void> {
+  try {
+    const resp = await fetch(`${BACKEND_URL}/api/whitelist/blocklist`);
+    if (resp.ok) {
+      const data = await resp.json();
+      localBlocklist = data.blocklist || [];
+      await chrome.storage.local.set({ cachedBlocklist: localBlocklist });
+    }
+  } catch {
+    // Load from storage as fallback
+    try {
+      const stored = await chrome.storage.local.get('cachedBlocklist');
+      localBlocklist = (stored.cachedBlocklist as typeof localBlocklist) || [];
+    } catch {}
+  }
+}
+
+function checkBlocklistLocally(url: string): { blocked: boolean; reason?: string } {
+  try {
+    const hostname = new URL(url).hostname.toLowerCase().replace(/^www\./, '');
+    const entry = localBlocklist.find(e =>
+      hostname === e.domain || hostname.endsWith('.' + e.domain)
+    );
+    if (entry) return { blocked: true, reason: entry.reason };
+  } catch {}
+  return { blocked: false };
+}
+
+// ============================================================================
+// Analysis Handler — backend-first with simulation fallback
 // ============================================================================
 
 async function analyzeSignals(signals: PageSignals, tabId: number): Promise<AnalysisResult> {
   updateStatus({ pendingAnalyses: extensionStatus.pendingAnalyses + 1 });
-  
+
   try {
-    // ========================================================================
-    // SIMULATION MODE - Replace with backend call when ready
-    // ========================================================================
-    
-    // Simulate network delay
-    await new Promise(resolve => setTimeout(resolve, 1500 + Math.random() * 1000));
-    
-    // Generate simulated analysis result
-    const result = simulateAnalysis(signals);
-    
-    // Cache the result
+    let result: AnalysisResult;
+
+    if (socket?.connected) {
+      // ── Backend path ─────────────────────────────────────────────────
+      try {
+        const session = await sendBehaviorBatch(signals);
+        if (session?.blocked) {
+          // URL is blocked → build a minimal result so popup can show warning
+          result = buildBlockedResult(signals);
+        } else if (session) {
+          result = mapSessionToResult(session, signals);
+        } else {
+          // Empty response → fall through to simulation
+          throw new Error('empty response');
+        }
+      } catch {
+        // Backend failed → queue + simulate locally
+        await addToOfflineQueue(signals);
+        result = simulateAnalysis(signals);
+        generateExplanationAsync(result);
+      }
+    } else {
+      // ── Offline / simulation path ────────────────────────────────────
+      await addToOfflineQueue(signals);
+      result = simulateAnalysis(signals);
+      generateExplanationAsync(result);
+    }
+
+    // Cache & store in session
     await setCachedResult(signals.domain, result);
-    
-    // Store in session for current tab
+
     const sessionResults = await chrome.storage.session.get('currentTabResults');
     const tabResults = (sessionResults.currentTabResults as Record<number, AnalysisResult>) || {};
     tabResults[tabId] = result;
     await chrome.storage.session.set({ currentTabResults: tabResults });
-    
-    // Start generating explanation asynchronously
-    generateExplanationAsync(result);
-    
-    return result;
-    
-    // ========================================================================
-    // BACKEND INTEGRATION (COMMENTED - Uncomment when backend is ready)
-    // ========================================================================
-    /*
-    return new Promise((resolve, reject) => {
-      if (!socket?.connected) {
-        // Queue for offline processing
-        addToOfflineQueue(signals);
-        reject(new Error('Backend not available'));
-        return;
+
+    // Block browsing for critically low trust scores or danger verdict
+    if (result.trustScore < 25 || result.verdict === 'danger') {
+      const reason = result.trustScore < 15
+        ? `Extremely low trust score (${result.trustScore}/100). This website exhibits highly dangerous behavior patterns.`
+        : result.verdict === 'danger'
+        ? `This website has been classified as dangerous (${result.trustScore}/100) based on analysis of its tracking, fingerprinting, and security practices.`
+        : `Very low trust score (${result.trustScore}/100). Proceed with extreme caution.`;
+
+      const blockUrl = chrome.runtime.getURL(
+        `blocked.html?type=${result.trustScore < 15 ? 'critical-verdict' : 'low-trust'}&url=${encodeURIComponent(result.url)}&reason=${encodeURIComponent(reason)}&score=${result.trustScore}&verdict=${result.verdict}`
+      );
+
+      // Redirect the tab to the blocked page
+      try {
+        await chrome.tabs.update(tabId, { url: blockUrl });
+      } catch {
+        // Tab might have been closed
       }
+    }
 
-      const analysisId = generateId();
-      
-      // Set up one-time listener for this analysis
-      const resultHandler = (result: AnalysisResult) => {
-        if (result.id === analysisId) {
-          socket?.off('analysis:result', resultHandler);
-          setCachedResult(signals.domain, result);
-          resolve(result);
-        }
-      };
-      
-      socket.on('analysis:result', resultHandler);
-      
-      // Send signals to backend
-      socket.emit('analyze:signals', {
-        id: analysisId,
-        signals,
-        tabId,
-      });
-
-      // Timeout after 30 seconds
-      setTimeout(() => {
-        socket?.off('analysis:result', resultHandler);
-        reject(new Error('Analysis timeout'));
-      }, 30000);
-    });
-    */
+    return result;
   } finally {
     updateStatus({ pendingAnalyses: extensionStatus.pendingAnalyses - 1 });
   }
 }
 
+function mapSessionToResult(session: any, signals: PageSignals): AnalysisResult {
+  const sb = session.signal_breakdown || {};
+  return {
+    id: session.id || generateId(),
+    url: session.url || signals.url,
+    domain: session.domain || signals.domain,
+    trustScore: session.trust_score ?? session.trustScore ?? 0,
+    verdict: session.verdict || 'warning',
+    signalScores: {
+      cookies: sb.cookies?.score ?? 100,
+      trackers: sb.trackers?.score ?? 100,
+      fingerprinting: sb.fingerprinting?.score ?? 100,
+      headers: sb.headers?.score ?? 100,
+      ssl: sb.ssl?.score ?? 100,
+    },
+    signals,
+    analyzedAt: session.created_at || new Date().toISOString(),
+    explanation: session.explanation
+      ? { status: 'complete' as const, text: session.explanation.text, generatedAt: session.explanation.generated_at }
+      : { status: 'pending' as const },
+  };
+}
+
+function buildBlockedResult(signals: PageSignals): AnalysisResult {
+  return {
+    id: generateId(),
+    url: signals.url,
+    domain: signals.domain,
+    trustScore: 0,
+    verdict: 'danger',
+    signalScores: { cookies: 0, trackers: 0, fingerprinting: 0, headers: 0, ssl: 0 },
+    signals,
+    analyzedAt: new Date().toISOString(),
+    explanation: {
+      status: 'complete',
+      text: 'This website is on the blocklist as a known dark-pattern site. Navigation has been blocked to protect you.',
+      generatedAt: new Date().toISOString(),
+    },
+  };
+}
+
 async function generateExplanationAsync(result: AnalysisResult): Promise<void> {
-  // Simulate explanation generation (in real implementation, this comes from backend via WebSocket)
+  // Simulation fallback for explanation
   await new Promise(resolve => setTimeout(resolve, 3000 + Math.random() * 2000));
-  
+
   const explanation = simulateExplanation(result);
-  
-  // Update the cached result with explanation
+
   const cached = await getCachedResult(result.domain);
   if (cached) {
-    cached.result.explanation = {
-      status: 'complete',
-      text: explanation,
-      generatedAt: new Date().toISOString(),
-    };
+    cached.result.explanation = { status: 'complete', text: explanation, generatedAt: new Date().toISOString() };
     await setCachedResult(result.domain, cached.result);
-    
-    // Notify popup about updated explanation
-    chrome.runtime.sendMessage({
-      type: 'ANALYSIS_RESULT',
-      result: cached.result,
-      fromCache: true,
-    }).catch(() => {
-      // Popup might not be open
-    });
+    chrome.runtime.sendMessage({ type: 'ANALYSIS_RESULT', result: cached.result, fromCache: true }).catch(() => {});
   }
 }
 
@@ -355,12 +547,10 @@ chrome.runtime.onMessage.addListener((
   sender: chrome.runtime.MessageSender, 
   sendResponse: (response?: unknown) => void
 ) => {
-  // Handle async responses
   const handleAsync = async (): Promise<unknown> => {
     switch (message.type) {
       case 'SIGNALS_COLLECTED': {
         const msg = message as { type: 'SIGNALS_COLLECTED'; signals: PageSignals };
-        // Resolve pending signal collection
         const tabId = sender.tab?.id;
         if (tabId && pendingSignalCollections.has(tabId)) {
           const resolver = pendingSignalCollections.get(tabId);
@@ -372,21 +562,12 @@ chrome.runtime.onMessage.addListener((
 
       case 'ANALYZE_PAGE': {
         const msg = message as { type: 'ANALYZE_PAGE'; tabId: number; url: string };
-        
-        // First, try to get from cache
         const domain = getDomainFromUrl(msg.url);
         const cached = await getCachedResult(domain);
-        
-        if (cached) {
-          return { result: cached.result, fromCache: true };
-        }
-        
-        // Collect signals from the content script
+        if (cached) return { result: cached.result, fromCache: true };
+
         const signals = await collectSignalsFromTab(msg.tabId, msg.url);
-        
-        // Analyze the signals
         const result = await analyzeSignals(signals, msg.tabId);
-        
         return { result, fromCache: false };
       }
 
@@ -396,19 +577,65 @@ chrome.runtime.onMessage.addListener((
         return { result: cached?.result || null };
       }
 
-      case 'GET_STATUS': {
+      case 'GET_STATUS':
         return { status: extensionStatus };
-      }
 
-      case 'CLEAR_CACHE': {
+      case 'CLEAR_CACHE':
         await chrome.storage.local.set({ cachedResults: {} });
         return { success: true };
-      }
 
       case 'OPEN_DASHBOARD': {
         const settings = await getSettings();
         await chrome.tabs.create({ url: settings.dashboardUrl });
         return { success: true };
+      }
+
+      // ── Auth: link extension with dashboard via link-code ──────────
+      case 'LINK_ACCOUNT': {
+        const msg = message as { type: 'LINK_ACCOUNT'; code: string };
+        try {
+          const resp = await fetch(`${BACKEND_URL}/api/auth/verify-link`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ linkCode: msg.code }),
+          });
+          if (!resp.ok) throw new Error('Invalid or expired code');
+          const data = await resp.json();
+          await setAuthTokens(data.accessToken, data.refreshToken);
+          initializeWebSocket(data.accessToken);
+          // Refresh blocklist after linking
+          fetchBlocklist();
+          return { success: true };
+        } catch (err: any) {
+          return { error: err.message || 'Link failed' };
+        }
+      }
+
+      case 'UNLINK_ACCOUNT': {
+        // Notify backend to revoke the extension's refresh token
+        let token = await getAuthToken();
+        const rt = await getRefreshToken();
+        // If access token is missing/expired, refresh it first so the logout call succeeds
+        if (!token && rt) {
+          token = await refreshExtensionToken();
+        }
+        if (token) {
+          try {
+            await fetch(`${BACKEND_URL}/api/auth/logout`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+              body: JSON.stringify({ refreshToken: rt }),
+            });
+          } catch { /* ignore – clear state regardless */ }
+        }
+        await clearAuthTokens();
+        return { success: true };
+      }
+
+      case 'CHECK_URL': {
+        const msg = message as { type: 'CHECK_URL'; url: string };
+        const res = await checkUrlBlocked(msg.url);
+        return res;
       }
 
       default:
@@ -420,8 +647,7 @@ chrome.runtime.onMessage.addListener((
     .then(sendResponse)
     .catch(error => sendResponse({ error: error.message }));
 
-  // Return true to indicate async response
-  return true;
+  return true; // async response
 });
 
 // ============================================================================
@@ -478,24 +704,72 @@ async function collectSignalsFromTab(tabId: number, url: string): Promise<PageSi
 chrome.runtime.onInstalled.addListener(async (details: chrome.runtime.InstalledDetails) => {
   console.log('[SenseAI] Extension installed:', details.reason);
   
-  // Initialize default settings
   const existing = await chrome.storage.local.get('settings');
   if (!existing.settings) {
     await chrome.storage.local.set({ settings: DEFAULT_SETTINGS });
   }
-  
-  // Initialize empty cache
   const cacheResult = await chrome.storage.local.get('cachedResults');
   if (!cacheResult.cachedResults) {
     await chrome.storage.local.set({ cachedResults: {} });
+  }
+
+  // Fetch blocklist for offline URL blocking
+  await fetchBlocklist();
+
+  // Try to connect if auth token exists
+  await tryConnect();
+});
+
+// ============================================================================
+// Dark-Pattern URL Blocking — intercept navigation
+// ============================================================================
+
+chrome.webNavigation.onBeforeNavigate.addListener(async (details) => {
+  if (details.frameId !== 0) return; // only top-level
+  if (!details.url.startsWith('http')) return;
+
+  // Check for bypass flag (user chose "Proceed Anyway" on blocked page)
+  try {
+    const bypassData = await chrome.storage.session.get('bypassBlock');
+    if (bypassData.bypassBlock === details.url) {
+      await chrome.storage.session.remove('bypassBlock');
+      return; // Allow navigation
+    }
+  } catch {}
+
+  // 1. Check local blocklist cache first (works offline)
+  const localCheck = checkBlocklistLocally(details.url);
+  if (localCheck.blocked) {
+    const warningUrl = chrome.runtime.getURL(
+      `blocked.html?type=blocklist&url=${encodeURIComponent(details.url)}&reason=${encodeURIComponent(localCheck.reason || 'Known dark-pattern website')}`
+    );
+    chrome.tabs.update(details.tabId, { url: warningUrl });
+    return;
+  }
+
+  // 2. Also check via backend socket if connected (real-time updates)
+  if (socket?.connected) {
+    const res = await checkUrlBlocked(details.url);
+    if (res.blocked) {
+      const warningUrl = chrome.runtime.getURL(
+        `blocked.html?type=blocklist&url=${encodeURIComponent(details.url)}&reason=${encodeURIComponent(res.reason || 'Known dark-pattern website')}`
+      );
+      chrome.tabs.update(details.tabId, { url: warningUrl });
+    }
   }
 });
 
 // Handle browser action (extension icon) click
 chrome.action.onClicked.addListener(async (tab: chrome.tabs.Tab) => {
-  // Popup will open automatically due to manifest configuration
   console.log('[SenseAI] Extension icon clicked for tab:', tab.id);
 });
 
 // Log when service worker starts
 console.log('[SenseAI] Background service worker initialized');
+
+// Auto-connect on startup
+tryConnect();
+
+// Fetch blocklist on startup and refresh periodically (every 6 hours)
+fetchBlocklist();
+setInterval(fetchBlocklist, 6 * 60 * 60 * 1000);

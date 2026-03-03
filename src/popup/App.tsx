@@ -6,7 +6,8 @@ import {
   AlertTriangle,
   Moon,
   Sun,
-  Settings,
+  Link2,
+  Unlink,
 } from 'lucide-react';
 import { 
   TrustScoreGauge, 
@@ -20,7 +21,7 @@ import {
   CardContent,
   ExplanationPanel,
 } from './components';
-import { cn, getDomainFromUrl, isAnalyzableUrl, truncate, formatRelativeTime } from '@/lib/utils';
+import { cn, getDomainFromUrl, isAnalyzableUrl, formatRelativeTime } from '@/lib/utils';
 import type { AnalysisResult, ExtensionStatus } from '@/types';
 
 type ViewState = 'loading' | 'analyzing' | 'result' | 'error' | 'not-analyzable';
@@ -39,6 +40,22 @@ export function App() {
   const [extensionStatus, setExtensionStatus] = useState<ExtensionStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isDarkMode, setIsDarkMode] = useState(false);
+  const [linkCode, setLinkCode] = useState('');
+  const [linkError, setLinkError] = useState<string | null>(null);
+  const [showLinkPanel, setShowLinkPanel] = useState(false);
+  const [linking, setLinking] = useState(false);
+  const [blockedInfo, setBlockedInfo] = useState<{ url: string; reason: string } | null>(null);
+
+  // Check if opened as a blocked-URL warning page
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('blocked') === 'true') {
+      setBlockedInfo({
+        url: params.get('url') || 'Unknown URL',
+        reason: params.get('reason') || 'Known dark-pattern website',
+      });
+    }
+  }, []);
 
   // Initialize theme from system/storage
   useEffect(() => {
@@ -204,6 +221,29 @@ export function App() {
     }
   }, [isDarkMode]);
 
+  // Link account via code
+  const handleLink = useCallback(async () => {
+    if (!linkCode.trim()) return;
+    setLinking(true);
+    setLinkError(null);
+    try {
+      const response = await chrome.runtime.sendMessage({ type: 'LINK_ACCOUNT', code: linkCode.trim() });
+      if (response?.error) throw new Error(response.error);
+      setShowLinkPanel(false);
+      setLinkCode('');
+    } catch (err: any) {
+      setLinkError(err.message || 'Failed to link account');
+    } finally {
+      setLinking(false);
+    }
+  }, [linkCode]);
+
+  // Unlink account
+  const handleUnlink = useCallback(async () => {
+    await chrome.runtime.sendMessage({ type: 'UNLINK_ACCOUNT' });
+    setExtensionStatus(prev => prev ? { ...prev, isAuthenticated: false, connectionStatus: 'offline' } : prev);
+  }, []);
+
   return (
     <div className="w-[360px] min-h-[400px] max-h-[560px] bg-background text-foreground flex flex-col overflow-hidden">
       {/* Header */}
@@ -220,6 +260,20 @@ export function App() {
         </div>
         
         <div className="flex items-center gap-1">
+          <button
+            onClick={() => setShowLinkPanel(!showLinkPanel)}
+            className={cn(
+              "p-1.5 rounded-md hover:bg-accent transition-colors",
+              extensionStatus?.isAuthenticated && "text-primary"
+            )}
+            aria-label={extensionStatus?.isAuthenticated ? 'Account linked' : 'Link account'}
+          >
+            {extensionStatus?.isAuthenticated ? (
+              <Link2 className="h-4 w-4" />
+            ) : (
+              <Unlink className="h-4 w-4 text-muted-foreground" />
+            )}
+          </button>
           <button
             onClick={toggleDarkMode}
             className="p-1.5 rounded-md hover:bg-accent transition-colors"
@@ -241,6 +295,42 @@ export function App() {
         </div>
       </header>
 
+      {/* Link Account Panel */}
+      {showLinkPanel && (
+        <div className="px-4 py-3 border-b border-border bg-muted/40 space-y-2">
+          {extensionStatus?.isAuthenticated ? (
+            <div className="flex items-center justify-between">
+              <span className="text-xs text-muted-foreground">Account linked ✓</span>
+              <button
+                onClick={handleUnlink}
+                className="text-xs text-destructive hover:underline"
+              >
+                Unlink
+              </button>
+            </div>
+          ) : (
+            <>
+              <p className="text-xs text-muted-foreground">
+                Paste the link code from your dashboard to connect:
+              </p>
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  value={linkCode}
+                  onChange={(e) => setLinkCode(e.target.value)}
+                  placeholder="Enter link code"
+                  className="flex-1 text-xs px-2 py-1.5 rounded-md border border-input bg-background"
+                />
+                <Button onClick={handleLink} size="sm" disabled={linking || !linkCode.trim()}>
+                  {linking ? '...' : 'Link'}
+                </Button>
+              </div>
+              {linkError && <p className="text-[10px] text-destructive">{linkError}</p>}
+            </>
+          )}
+        </div>
+      )}
+
       {/* Current Site Info */}
       {currentTab && viewState !== 'not-analyzable' && (
         <div className="px-4 py-2 bg-muted/30 border-b border-border">
@@ -252,7 +342,17 @@ export function App() {
 
       {/* Main Content */}
       <main className="flex-1 overflow-y-auto">
-        {viewState === 'not-analyzable' && (
+        {blockedInfo && (
+          <div className="flex flex-col items-center justify-center h-full py-8 px-4 text-center">
+            <Shield className="h-12 w-12 text-destructive mb-3" />
+            <h3 className="text-sm font-semibold text-destructive mb-1">Navigation Blocked</h3>
+            <p className="text-xs text-muted-foreground mb-2 break-all max-w-[280px]">{blockedInfo.url}</p>
+            <p className="text-xs text-muted-foreground mb-4">{blockedInfo.reason}</p>
+            <Button onClick={() => history.back()} variant="outline" size="sm">Go Back</Button>
+          </div>
+        )}
+
+        {!blockedInfo && viewState === 'not-analyzable' && (
           <div className="flex flex-col items-center justify-center h-full py-8 px-4 text-center">
             <AlertTriangle className="h-10 w-10 text-muted-foreground mb-3" />
             <h3 className="text-sm font-medium mb-1">Cannot Analyze This Page</h3>
@@ -359,6 +459,8 @@ export function App() {
                   ? 'bg-trust-safe' 
                   : extensionStatus?.connectionStatus === 'connecting'
                   ? 'bg-trust-warning animate-pulse'
+                  : extensionStatus?.isAuthenticated
+                  ? 'bg-destructive'
                   : 'bg-muted-foreground'
               )}
             />
@@ -367,7 +469,9 @@ export function App() {
                 ? 'Connected'
                 : extensionStatus?.connectionStatus === 'connecting'
                 ? 'Connecting...'
-                : 'Simulation Mode'}
+                : extensionStatus?.isAuthenticated
+                ? 'Disconnected'
+                : 'Offline — link account to connect'}
             </span>
           </div>
           <span className="text-[10px] text-muted-foreground">v1.0.0</span>

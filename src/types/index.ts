@@ -106,7 +106,11 @@ export type MessageType =
   | 'STATUS_UPDATE'
   | 'AUTH_TOKEN_SET'
   | 'AUTH_TOKEN_CLEARED'
-  | 'OPEN_DASHBOARD';
+  | 'OPEN_DASHBOARD'
+  | 'LINK_ACCOUNT'
+  | 'UNLINK_ACCOUNT'
+  | 'CHECK_URL'
+  | 'URL_BLOCKED';
 
 export interface BaseMessage {
   type: MessageType;
@@ -162,7 +166,11 @@ export type ExtensionMessage =
   | { type: 'CLEAR_CACHE' }
   | { type: 'OPEN_DASHBOARD' }
   | { type: 'AUTH_TOKEN_SET'; token: string }
-  | { type: 'AUTH_TOKEN_CLEARED' };
+  | { type: 'AUTH_TOKEN_CLEARED' }
+  | { type: 'LINK_ACCOUNT'; code: string }
+  | { type: 'UNLINK_ACCOUNT' }
+  | { type: 'CHECK_URL'; url: string }
+  | { type: 'URL_BLOCKED'; blocked: boolean; reason?: string };
 
 // ============================================================================
 // Extension State Types
@@ -222,5 +230,5 @@ export const DEFAULT_SETTINGS: ExtensionSettings = {
   showNotifications: true,
   cacheExpiration: 24,
   darkMode: 'auto',
-  dashboardUrl: 'http://localhost:5173', // Web app URL
+  dashboardUrl: import.meta.env.VITE_DASHBOARD_URL || 'http://localhost:8080',
 };
