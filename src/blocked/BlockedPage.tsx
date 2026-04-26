@@ -46,7 +46,7 @@ export function BlockedPage() {
 
   const handleGoBack = () => {
     if (window.history.length > 1) {
-      window.history.back();
+      window.history.go(-2);
     } else {
       window.close();
     }

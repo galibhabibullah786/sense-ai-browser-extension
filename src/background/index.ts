@@ -13,6 +13,7 @@
 import { io, Socket } from 'socket.io-client';
 import type {
   AnalysisResult,
+  Verdict,
   ExtensionMessage,
   ExtensionStatus,
   PageSignals,
@@ -22,7 +23,7 @@ import type {
 } from '../types';
 import { DEFAULT_SETTINGS } from '../types';
 import { generateId, getDomainFromUrl } from '../lib/utils';
-import { simulateAnalysis, simulateExplanation } from './simulation';
+import { simulateExplanation } from './simulation';
 
 const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:3000';
 const MAX_RECONNECT = 5;
@@ -40,18 +41,41 @@ let extensionStatus: ExtensionStatus = {
 
 let socket: Socket | null = null;
 let reconnectAttempts = 0;
+let currentSocketToken: string | null = null;
 const pendingSignalCollections = new Map<number, (s: PageSignals) => void>();
 let localBlocklist: Array<{ domain: string; reason: string }> = [];
+
+interface BackendTrustResultPayload {
+  sessionId?: string;
+  id?: string;
+  url?: string;
+  domain?: string;
+  score?: number;
+  trustScore?: number;
+  trust_score?: number;
+  verdict?: string;
+  verdictDisplay?: Verdict;
+  signals?: Record<string, any>;
+  signal_breakdown?: Record<string, any>;
+  explanation?: string | { text?: string; generated_at?: string; generatedAt?: string };
+  analyzedAt?: string;
+  created_at?: string;
+}
 
 // ============================================================================
 // WebSocket Connection
 // ============================================================================
 
-function initializeWebSocket(token: string): void {
-  if (socket?.connected) return;
+function initializeWebSocket(token?: string): void {
+  currentSocketToken = token || null;
+
+  if (socket) {
+    socket.disconnect();
+    socket = null;
+  }
 
   socket = io(BACKEND_URL, {
-    auth: { token },
+    auth: token ? { token } : {},
     transports: ['websocket'],
     reconnection: true,
     reconnectionDelay: 1000,
@@ -73,11 +97,13 @@ function initializeWebSocket(token: string): void {
 
   socket.on('connect_error', async () => {
     reconnectAttempts++;
-    // On first failure, try refreshing the access token
-    if (reconnectAttempts === 1) {
+    // On first auth connection failure, try refreshing the linked token.
+    if (reconnectAttempts === 1 && currentSocketToken) {
       const newToken = await refreshExtensionToken();
       if (newToken && socket) {
+        currentSocketToken = newToken;
         socket.auth = { token: newToken };
+        socket.connect();
       }
     }
     if (reconnectAttempts >= MAX_RECONNECT) {
@@ -102,13 +128,7 @@ function initializeWebSocket(token: string): void {
   socket.on('extension:unlinked', async () => {
     console.log('[SenseAI] Extension unlinked from dashboard');
     await clearAuthTokens();
-    updateStatus({ isAuthenticated: false, connectionStatus: 'offline' });
   });
-}
-
-function disconnectWebSocket(): void {
-  if (socket) { socket.disconnect(); socket = null; }
-  updateStatus({ connectionStatus: 'disconnected', isAuthenticated: false });
 }
 
 // ============================================================================
@@ -118,31 +138,18 @@ function disconnectWebSocket(): void {
 async function handleBackendResult(session: any): Promise<void> {
   if (!session) return;
 
-  const domain = session.domain || getDomainFromUrl(session.url);
-  // Map backend session to AnalysisResult shape used by popup
-  const mapped: AnalysisResult = {
-    id: session.id,
-    url: session.url,
-    domain,
-    trustScore: session.trust_score ?? session.trustScore ?? 0,
-    verdict: session.verdict || 'warning',
-    signalScores: session.signal_breakdown
-      ? {
-          cookies: session.signal_breakdown.cookies?.score ?? 100,
-          trackers: session.signal_breakdown.trackers?.score ?? 100,
-          fingerprinting: session.signal_breakdown.fingerprinting?.score ?? 100,
-          headers: session.signal_breakdown.headers?.score ?? 100,
-          ssl: session.signal_breakdown.ssl?.score ?? 100,
-        }
-      : { cookies: 100, trackers: 100, fingerprinting: 100, headers: 100, ssl: 100 },
-    signals: { url: session.url, domain, timestamp: session.created_at || new Date().toISOString(), cookies: { count: 0, thirdPartyCount: 0, cookies: [] }, trackers: { detected: [], blocked: 0, scripts: [] }, fingerprinting: { techniques: [], risk: 'low' }, headers: { present: [], missing: [], issues: [] }, ssl: { valid: true } },
-    analyzedAt: session.created_at || new Date().toISOString(),
-    explanation: session.explanation
-      ? { status: 'complete' as const, text: session.explanation.text, generatedAt: session.explanation.generated_at }
-      : { status: 'pending' as const },
-  };
+  const mapped = mapSessionToResult(session, {
+    url: session.url || '',
+    domain: session.domain || getDomainFromUrl(session.url || ''),
+    timestamp: session.created_at || new Date().toISOString(),
+    cookies: { count: 0, thirdPartyCount: 0, cookies: [] },
+    trackers: { detected: [], blocked: 0, scripts: [] },
+    fingerprinting: { techniques: [], risk: 'low' },
+    headers: { present: [], missing: [], issues: [] },
+    ssl: { valid: true },
+  });
 
-  await setCachedResult(domain, mapped);
+  await setCachedResult(mapped.domain, mapped);
 
   // Notify popup
   chrome.runtime.sendMessage({ type: 'ANALYSIS_RESULT', result: mapped, fromCache: false }).catch(() => {});
@@ -154,6 +161,8 @@ async function sendBehaviorBatch(signals: PageSignals): Promise<any> {
       reject(new Error('Not connected'));
       return;
     }
+
+    const timeoutId = setTimeout(() => reject(new Error('Backend analysis timeout')), 30000);
 
     socket.emit(
       'behavior:batch',
@@ -169,6 +178,7 @@ async function sendBehaviorBatch(signals: PageSignals): Promise<any> {
         },
       },
       (response: any) => {
+        clearTimeout(timeoutId);
         if (response?.type === 'url:blocked') {
           resolve({ blocked: true, reason: response.reason });
         } else if (response?.type === 'analysis:result') {
@@ -180,9 +190,6 @@ async function sendBehaviorBatch(signals: PageSignals): Promise<any> {
         }
       }
     );
-
-    // Timeout
-    setTimeout(() => reject(new Error('Backend analysis timeout')), 30000);
   });
 }
 
@@ -341,11 +348,13 @@ async function setAuthTokens(accessToken: string, refreshToken?: string): Promis
   if (refreshToken) data.refreshToken = refreshToken;
   await chrome.storage.local.set(data);
   updateStatus({ isAuthenticated: true });
+  initializeWebSocket(accessToken);
 }
 
 async function clearAuthTokens(): Promise<void> {
   await chrome.storage.local.remove(['authToken', 'refreshToken']);
-  disconnectWebSocket();
+  updateStatus({ isAuthenticated: false });
+  initializeWebSocket();
 }
 
 async function refreshExtensionToken(): Promise<string | null> {
@@ -375,10 +384,8 @@ async function tryConnect(): Promise<void> {
     // Access token missing; try to obtain a new one from refresh token
     token = await refreshExtensionToken();
   }
-  if (token) {
-    updateStatus({ isAuthenticated: true, connectionStatus: 'connecting' });
-    initializeWebSocket(token);
-  }
+  updateStatus({ isAuthenticated: !!token, connectionStatus: 'connecting' });
+  initializeWebSocket(token || undefined);
 }
 
 // ============================================================================
@@ -432,21 +439,19 @@ async function analyzeSignals(signals: PageSignals, tabId: number): Promise<Anal
           result = buildBlockedResult(signals);
         } else if (session) {
           result = mapSessionToResult(session, signals);
+          if (result.explanation?.status !== 'complete') {
+            generateExplanationAsync(result);
+          }
         } else {
-          // Empty response → fall through to simulation
-          throw new Error('empty response');
+          throw new Error('Analysis service returned an empty response.');
         }
       } catch {
-        // Backend failed → queue + simulate locally
         await addToOfflineQueue(signals);
-        result = simulateAnalysis(signals);
-        generateExplanationAsync(result);
+        throw new Error('Live analysis failed. Your request was queued for retry. Please reconnect and try again.');
       }
     } else {
-      // ── Offline / simulation path ────────────────────────────────────
-      await addToOfflineQueue(signals);
-      result = simulateAnalysis(signals);
-      generateExplanationAsync(result);
+      // ── Offline path ─────────────────────────────────────────────────
+      throw new Error('Live analysis is unavailable. Please check backend connectivity and try again.');
     }
 
     // Cache & store in session
@@ -478,19 +483,54 @@ async function analyzeSignals(signals: PageSignals, tabId: number): Promise<Anal
     }
 
     return result;
+  } catch (error) {
+    if (error instanceof Error) {
+      throw error;
+    }
+    throw new Error('Unable to analyze this site right now. Please try again.');
   } finally {
     updateStatus({ pendingAnalyses: extensionStatus.pendingAnalyses - 1 });
   }
 }
 
 function mapSessionToResult(session: any, signals: PageSignals): AnalysisResult {
-  const sb = session.signal_breakdown || {};
-  return {
-    id: session.id || generateId(),
-    url: session.url || signals.url,
-    domain: session.domain || signals.domain,
-    trustScore: session.trust_score ?? session.trustScore ?? 0,
-    verdict: session.verdict || 'warning',
+  const payload = (session || {}) as BackendTrustResultPayload;
+  const sb = payload.signal_breakdown || payload.signals || {};
+  const trustScoreRaw = payload.score ?? payload.trust_score ?? payload.trustScore;
+  const trustScore = typeof trustScoreRaw === 'number'
+    ? Math.max(0, Math.min(100, trustScoreRaw))
+    : 0;
+
+  const normalizeVerdict = (rawVerdict?: string, displayVerdict?: Verdict): Verdict => {
+    if (displayVerdict === 'safe' || displayVerdict === 'warning' || displayVerdict === 'danger') {
+      return displayVerdict;
+    }
+    switch ((rawVerdict || '').toUpperCase()) {
+      case 'HIGH_TRUST':
+        return 'safe';
+      case 'MEDIUM_TRUST':
+        return 'warning';
+      case 'LOW_TRUST':
+      case 'DANGEROUS':
+        return 'danger';
+      default:
+        return trustScore < 40 ? 'danger' : trustScore < 70 ? 'warning' : 'safe';
+    }
+  };
+
+  const explanationText = typeof payload.explanation === 'string'
+    ? payload.explanation
+    : payload.explanation?.text;
+  const explanationGeneratedAt = typeof payload.explanation === 'object'
+    ? payload.explanation?.generated_at || payload.explanation?.generatedAt
+    : undefined;
+
+  const result: AnalysisResult = {
+    id: payload.id || payload.sessionId || generateId(),
+    url: payload.url || signals.url,
+    domain: payload.domain || signals.domain,
+    trustScore,
+    verdict: normalizeVerdict(payload.verdict, payload.verdictDisplay),
     signalScores: {
       cookies: sb.cookies?.score ?? 100,
       trackers: sb.trackers?.score ?? 100,
@@ -499,11 +539,13 @@ function mapSessionToResult(session: any, signals: PageSignals): AnalysisResult 
       ssl: sb.ssl?.score ?? 100,
     },
     signals,
-    analyzedAt: session.created_at || new Date().toISOString(),
-    explanation: session.explanation
-      ? { status: 'complete' as const, text: session.explanation.text, generatedAt: session.explanation.generated_at }
-      : { status: 'pending' as const },
+    analyzedAt: payload.analyzedAt || payload.created_at || new Date().toISOString(),
+    explanation: explanationText
+      ? { status: 'complete', text: explanationText, generatedAt: explanationGeneratedAt || new Date().toISOString() }
+      : { status: 'pending' },
   };
+
+  return result;
 }
 
 function buildBlockedResult(signals: PageSignals): AnalysisResult {
@@ -525,7 +567,7 @@ function buildBlockedResult(signals: PageSignals): AnalysisResult {
 }
 
 async function generateExplanationAsync(result: AnalysisResult): Promise<void> {
-  // Simulation fallback for explanation
+  // Keep trust analysis strictly backend-driven; only explanation can be simulated.
   await new Promise(resolve => setTimeout(resolve, 3000 + Math.random() * 2000));
 
   const explanation = simulateExplanation(result);
@@ -566,9 +608,16 @@ chrome.runtime.onMessage.addListener((
         const cached = await getCachedResult(domain);
         if (cached) return { result: cached.result, fromCache: true };
 
-        const signals = await collectSignalsFromTab(msg.tabId, msg.url);
-        const result = await analyzeSignals(signals, msg.tabId);
-        return { result, fromCache: false };
+        try {
+          const signals = await collectSignalsFromTab(msg.tabId, msg.url);
+          const result = await analyzeSignals(signals, msg.tabId);
+          return { result, fromCache: false };
+        } catch (error) {
+          const message = error instanceof Error
+            ? error.message
+            : 'Live analysis failed. Please check your connection and try again.';
+          return { error: message };
+        }
       }
 
       case 'GET_CACHED_RESULT': {
@@ -602,7 +651,6 @@ chrome.runtime.onMessage.addListener((
           if (!resp.ok) throw new Error('Invalid or expired code');
           const data = await resp.json();
           await setAuthTokens(data.accessToken, data.refreshToken);
-          initializeWebSocket(data.accessToken);
           // Refresh blocklist after linking
           fetchBlocklist();
           return { success: true };
@@ -655,7 +703,18 @@ chrome.runtime.onMessage.addListener((
 // ============================================================================
 
 async function collectSignalsFromTab(tabId: number, url: string): Promise<PageSignals> {
-  return new Promise((resolve, reject) => {
+  const buildFallbackSignals = (): PageSignals => ({
+    url,
+    domain: getDomainFromUrl(url),
+    timestamp: new Date().toISOString(),
+    cookies: { count: 0, thirdPartyCount: 0, cookies: [] },
+    trackers: { detected: [], blocked: 0, scripts: [] },
+    fingerprinting: { techniques: [], risk: 'low' },
+    headers: { present: [], missing: [], issues: [] },
+    ssl: { valid: url.startsWith('https://') },
+  });
+
+  return new Promise((resolve) => {
     // Set up resolver for when content script responds
     pendingSignalCollections.set(tabId, resolve);
     
@@ -664,16 +723,29 @@ async function collectSignalsFromTab(tabId: number, url: string): Promise<PageSi
       .catch(async () => {
         // Content script might not be loaded, inject it
         try {
-          await chrome.scripting.executeScript({
-            target: { tabId },
-            files: ['src/content/index.ts'],
-          });
-          
+          // Some runtime contexts only accept JavaScript file extensions.
+          // Try the built JS path first, then legacy TS path for environments that support it.
+          try {
+            await chrome.scripting.executeScript({
+              target: { tabId },
+              files: ['src/content/index.js'],
+            });
+          } catch {
+            await chrome.scripting.executeScript({
+              target: { tabId },
+              files: ['src/content/index.ts'],
+            });
+          }
+
           // Try again
-          chrome.tabs.sendMessage(tabId, { type: 'COLLECT_SIGNALS' }).catch(reject);
+          chrome.tabs.sendMessage(tabId, { type: 'COLLECT_SIGNALS' }).catch(() => {
+            pendingSignalCollections.delete(tabId);
+            resolve(buildFallbackSignals());
+          });
         } catch (error) {
           pendingSignalCollections.delete(tabId);
-          reject(error);
+          console.warn('[SenseAI] Content script injection failed, using fallback signals:', error);
+          resolve(buildFallbackSignals());
         }
       });
 
@@ -682,16 +754,7 @@ async function collectSignalsFromTab(tabId: number, url: string): Promise<PageSi
       if (pendingSignalCollections.has(tabId)) {
         pendingSignalCollections.delete(tabId);
         // Return basic signals if collection fails
-        resolve({
-          url,
-          domain: getDomainFromUrl(url),
-          timestamp: new Date().toISOString(),
-          cookies: { count: 0, thirdPartyCount: 0, cookies: [] },
-          trackers: { detected: [], blocked: 0, scripts: [] },
-          fingerprinting: { techniques: [], risk: 'low' },
-          headers: { present: [], missing: [], issues: [] },
-          ssl: { valid: url.startsWith('https://') },
-        });
+        resolve(buildFallbackSignals());
       }
     }, 10000);
   });

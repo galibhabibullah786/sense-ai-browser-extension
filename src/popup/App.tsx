@@ -241,7 +241,7 @@ export function App() {
   // Unlink account
   const handleUnlink = useCallback(async () => {
     await chrome.runtime.sendMessage({ type: 'UNLINK_ACCOUNT' });
-    setExtensionStatus(prev => prev ? { ...prev, isAuthenticated: false, connectionStatus: 'offline' } : prev);
+    setExtensionStatus(prev => prev ? { ...prev, isAuthenticated: false } : prev);
   }, []);
 
   return (
@@ -311,7 +311,7 @@ export function App() {
           ) : (
             <>
               <p className="text-xs text-muted-foreground">
-                Paste the link code from your dashboard to connect:
+                Paste the link code from your dashboard to sync analyses there (local analysis still works without linking):
               </p>
               <div className="flex gap-2">
                 <input
@@ -466,12 +466,16 @@ export function App() {
             />
             <span className="text-[10px] text-muted-foreground">
               {extensionStatus?.connectionStatus === 'connected' 
-                ? 'Connected'
+                ? 'Server connected'
                 : extensionStatus?.connectionStatus === 'connecting'
-                ? 'Connecting...'
-                : extensionStatus?.isAuthenticated
-                ? 'Disconnected'
-                : 'Offline — link account to connect'}
+                ? 'Connecting to server...'
+                : 'Server offline'}
+            </span>
+            <span className="text-[10px] text-muted-foreground">
+              •
+            </span>
+            <span className="text-[10px] text-muted-foreground">
+              {extensionStatus?.isAuthenticated ? 'Dashboard linked' : 'Not linked'}
             </span>
           </div>
           <span className="text-[10px] text-muted-foreground">v1.0.0</span>
