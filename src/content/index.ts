@@ -8,6 +8,146 @@
 import type { PageSignals, CookieInfo, CookieSignal, TrackerSignal, FingerprintSignal, HeaderSignal, SSLSignal } from '../types';
 
 // ============================================================================
+// Ad & Popup Blocker (content-side heuristics)
+// ============================================================================
+
+(() => {
+  const adHostPattern = /doubleclick\.net|googlesyndication\.com|adservice\.google\.com|popads\.net|popcash\.net|trafficjunky\.net|exoclick\.com|juicyads\.com|propellerads\.com|adnxs\.com/i;
+  const adKeywordPattern = /(popup|overlay|ad[-_]?banner|adunit|interstitial|sponsor|promoted)/i;
+  const popupGuardEvent = 'senseai-popup-guard-toggle';
+  let enabled = true;
+  let observer: MutationObserver | null = null;
+
+  const dispatchPopupGuardToggle = (value: boolean) => {
+    window.dispatchEvent(new CustomEvent(popupGuardEvent, { detail: { enabled: value } }));
+  };
+
+  const hasMeaningfulText = (element: Element): boolean => {
+    const text = (element.textContent || '').trim();
+    return text.length > 60;
+  };
+
+  const getZIndex = (element: Element): number => {
+    const zIndex = window.getComputedStyle(element).zIndex;
+    const parsed = Number.parseInt(zIndex, 10);
+    return Number.isFinite(parsed) ? parsed : 0;
+  };
+
+  const isFixedOverlay = (element: Element): boolean => {
+    const style = window.getComputedStyle(element);
+    return (style.position === 'fixed' || style.position === 'absolute') && getZIndex(element) >= 1000;
+  };
+
+  const isRootIframeAd = (element: Element): boolean => {
+    if (element.tagName !== 'IFRAME') return false;
+    if (element.parentElement !== document.body) return false;
+    const src = (element.getAttribute('src') || '').toLowerCase();
+    return adHostPattern.test(src);
+  };
+
+  const matchesAdKeywords = (element: Element): boolean => {
+    const id = (element.getAttribute('id') || '').toLowerCase();
+    const className = (element.getAttribute('class') || '').toLowerCase();
+    return adKeywordPattern.test(id) || adKeywordPattern.test(className);
+  };
+
+  const shouldHide = (element: Element): boolean => {
+    if (!(element instanceof HTMLElement)) return false;
+    if (element.hasAttribute('data-senseai-adblock')) return false;
+    if (isRootIframeAd(element)) return true;
+    if (matchesAdKeywords(element) && isFixedOverlay(element) && !hasMeaningfulText(element)) return true;
+    return false;
+  };
+
+  const hideElement = (element: Element) => {
+    element.setAttribute('data-senseai-adblock', 'true');
+    (element as HTMLElement).style.setProperty('display', 'none', 'important');
+  };
+
+  const scanForAds = (root: ParentNode | Element) => {
+    if (!enabled) return;
+    if (root instanceof Element && shouldHide(root)) {
+      hideElement(root);
+    }
+
+    const candidates = (root as ParentNode).querySelectorAll?.('iframe, div, section, aside');
+    if (!candidates) return;
+    candidates.forEach(candidate => {
+      if (shouldHide(candidate)) {
+        hideElement(candidate);
+      }
+    });
+  };
+
+  const enableBlocker = () => {
+    if (!observer) {
+      observer = new MutationObserver(mutations => {
+        for (const mutation of mutations) {
+          mutation.addedNodes.forEach(node => {
+            if (node instanceof Element) {
+              scanForAds(node);
+            }
+          });
+        }
+      });
+
+      observer.observe(document.documentElement || document.body, {
+        childList: true,
+        subtree: true,
+      });
+    }
+
+    scanForAds(document);
+  };
+
+  const disableBlocker = () => {
+    if (observer) {
+      observer.disconnect();
+      observer = null;
+    }
+  };
+
+  const setEnabled = (value: boolean) => {
+    if (enabled === value) {
+      dispatchPopupGuardToggle(value);
+      return;
+    }
+
+    enabled = value;
+    if (enabled) {
+      enableBlocker();
+    } else {
+      disableBlocker();
+    }
+    dispatchPopupGuardToggle(enabled);
+  };
+
+  chrome.runtime.onMessage.addListener((message: { type?: string; enabled?: boolean }) => {
+    if (message?.type === 'TOGGLE_AD_BLOCK') {
+      setEnabled(message.enabled !== false);
+    }
+  });
+
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area !== 'local' || !('adBlockEnabled' in changes)) return;
+    const next = typeof changes.adBlockEnabled?.newValue === 'boolean'
+      ? changes.adBlockEnabled.newValue
+      : true;
+    setEnabled(next);
+  });
+
+  chrome.storage.local.get('adBlockEnabled').then(result => {
+    if (typeof result.adBlockEnabled === 'boolean') {
+      setEnabled(result.adBlockEnabled);
+    } else {
+      setEnabled(true);
+    }
+  }).catch(() => {
+    setEnabled(true);
+  });
+})();
+
+// ============================================================================
 // Signal Collection Functions
 // ============================================================================
 

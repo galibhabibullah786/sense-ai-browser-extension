@@ -45,6 +45,8 @@ export function App() {
   const [showLinkPanel, setShowLinkPanel] = useState(false);
   const [linking, setLinking] = useState(false);
   const [blockedInfo, setBlockedInfo] = useState<{ url: string; reason: string } | null>(null);
+  const [adBlockEnabled, setAdBlockEnabled] = useState(true);
+  const [adBlockLoading, setAdBlockLoading] = useState(true);
 
   // Check if opened as a blocked-URL warning page
   useEffect(() => {
@@ -81,6 +83,38 @@ export function App() {
     };
 
     initTheme();
+  }, []);
+
+  // Initialize ad & popup blocker state
+  useEffect(() => {
+    let isMounted = true;
+
+    const initAdBlock = async () => {
+      try {
+        const result = await chrome.storage.local.get('adBlockEnabled');
+        const enabled = typeof result.adBlockEnabled === 'boolean' ? result.adBlockEnabled : true;
+
+        if (isMounted) {
+          setAdBlockEnabled(enabled);
+          setAdBlockLoading(false);
+        }
+
+        if (typeof result.adBlockEnabled !== 'boolean') {
+          await chrome.storage.local.set({ adBlockEnabled: true });
+        }
+      } catch (err) {
+        console.error('[SenseAI Popup] Error reading ad block setting:', err);
+        if (isMounted) {
+          setAdBlockEnabled(true);
+          setAdBlockLoading(false);
+        }
+      }
+    };
+
+    initAdBlock();
+    return () => {
+      isMounted = false;
+    };
   }, []);
 
   // Apply dark mode class
@@ -221,6 +255,24 @@ export function App() {
     }
   }, [isDarkMode]);
 
+  const toggleAdBlock = useCallback(async () => {
+    const nextEnabled = !adBlockEnabled;
+    setAdBlockEnabled(nextEnabled);
+
+    try {
+      await chrome.storage.local.set({ adBlockEnabled: nextEnabled });
+      if (currentTab?.id) {
+        await chrome.tabs.sendMessage(currentTab.id, {
+          type: 'TOGGLE_AD_BLOCK',
+          enabled: nextEnabled,
+        });
+      }
+    } catch (err) {
+      console.error('[SenseAI Popup] Error toggling ad block:', err);
+      setAdBlockEnabled(prev => !prev);
+    }
+  }, [adBlockEnabled, currentTab]);
+
   // Link account via code
   const handleLink = useCallback(async () => {
     if (!linkCode.trim()) return;
@@ -342,6 +394,44 @@ export function App() {
 
       {/* Main Content */}
       <main className="flex-1 overflow-y-auto">
+        {!blockedInfo && (
+          <div className="px-4 pt-4">
+            <Card>
+              <CardHeader className="pb-2">
+                <CardTitle>Protection</CardTitle>
+              </CardHeader>
+              <CardContent>
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-3">
+                    <div
+                      className={cn(
+                        'h-7 w-7 rounded-md flex items-center justify-center',
+                        adBlockEnabled ? 'bg-trust-safe/15 text-trust-safe' : 'bg-muted text-muted-foreground'
+                      )}
+                    >
+                      <Shield className="h-4 w-4" />
+                    </div>
+                    <div>
+                      <p className="text-xs font-medium">Ad & Popup Blocker</p>
+                      <p className="text-[10px] text-muted-foreground">
+                        {adBlockEnabled ? 'Blocking popups and common ad overlays' : 'Protection paused'}
+                      </p>
+                    </div>
+                  </div>
+                  <Button
+                    size="sm"
+                    variant={adBlockEnabled ? 'secondary' : 'outline'}
+                    onClick={toggleAdBlock}
+                    disabled={adBlockLoading}
+                    className="min-w-[56px]"
+                  >
+                    {adBlockEnabled ? 'On' : 'Off'}
+                  </Button>
+                </div>
+              </CardContent>
+            </Card>
+          </div>
+        )}
         {blockedInfo && (
           <div className="flex flex-col items-center justify-center h-full py-8 px-4 text-center">
             <Shield className="h-12 w-12 text-destructive mb-3" />

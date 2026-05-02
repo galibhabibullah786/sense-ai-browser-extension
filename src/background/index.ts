@@ -581,6 +581,64 @@ async function generateExplanationAsync(result: AnalysisResult): Promise<void> {
 }
 
 // ============================================================================
+// Ad & Popup Tab Blocking
+// ============================================================================
+
+const AD_BLOCK_DOMAINS = [
+  'doubleclick.net',
+  'googlesyndication.com',
+  'adservice.google.com',
+  'popads.net',
+  'popcash.net',
+  'trafficjunky.net',
+  'exoclick.com',
+  'juicyads.com',
+  'propellerads.com',
+  'adnxs.com',
+];
+
+const pendingAdTabs = new Map<number, number>();
+
+function getHostnameFromUrl(url: string): string {
+  try {
+    return new URL(url).hostname.toLowerCase().replace(/^www\./, '');
+  } catch {
+    return '';
+  }
+}
+
+function isAdUrl(url: string): boolean {
+  const hostname = getHostnameFromUrl(url);
+  if (!hostname) return false;
+  return AD_BLOCK_DOMAINS.some(domain => hostname === domain || hostname.endsWith(`.${domain}`));
+}
+
+function isBlankUrl(url: string): boolean {
+  return !url || url === 'about:blank';
+}
+
+async function getAdBlockEnabled(): Promise<boolean> {
+  try {
+    const result = await chrome.storage.local.get('adBlockEnabled');
+    return typeof result.adBlockEnabled === 'boolean' ? result.adBlockEnabled : true;
+  } catch {
+    return true;
+  }
+}
+
+function trackPendingAdTab(tabId: number): void {
+  if (pendingAdTabs.has(tabId)) return;
+  const timeoutId = setTimeout(() => pendingAdTabs.delete(tabId), 10000) as unknown as number;
+  pendingAdTabs.set(tabId, timeoutId);
+}
+
+function clearPendingAdTab(tabId: number): void {
+  const timeoutId = pendingAdTabs.get(tabId);
+  if (timeoutId) clearTimeout(timeoutId);
+  pendingAdTabs.delete(tabId);
+}
+
+// ============================================================================
 // Message Handler
 // ============================================================================
 
@@ -763,6 +821,60 @@ async function collectSignalsFromTab(tabId: number, url: string): Promise<PageSi
 // ============================================================================
 // Extension Lifecycle
 // ============================================================================
+
+chrome.tabs.onCreated.addListener(async (tab) => {
+  if (!tab.id) return;
+  if (!(await getAdBlockEnabled())) return;
+
+  const url = tab.pendingUrl || tab.url || '';
+  if (isAdUrl(url)) {
+    chrome.tabs.remove(tab.id).catch(() => {});
+    return;
+  }
+
+  if (isBlankUrl(url)) {
+    trackPendingAdTab(tab.id);
+  }
+});
+
+chrome.webNavigation.onCreatedNavigationTarget.addListener(async (details) => {
+  if (!(await getAdBlockEnabled())) return;
+  if (details.tabId === -1) return;
+
+  const url = details.url || '';
+  if (isAdUrl(url)) {
+    chrome.tabs.remove(details.tabId).catch(() => {});
+    return;
+  }
+
+  if (isBlankUrl(url)) {
+    trackPendingAdTab(details.tabId);
+  }
+});
+
+chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
+  if (!(await getAdBlockEnabled())) {
+    clearPendingAdTab(tabId);
+    return;
+  }
+
+  const url = changeInfo.url || tab.pendingUrl || tab.url || '';
+  const hasOpener = typeof tab.openerTabId === 'number';
+
+  if (isAdUrl(url) && (pendingAdTabs.has(tabId) || hasOpener)) {
+    chrome.tabs.remove(tabId).catch(() => {});
+    clearPendingAdTab(tabId);
+    return;
+  }
+
+  if (pendingAdTabs.has(tabId) && !isBlankUrl(url)) {
+    clearPendingAdTab(tabId);
+  }
+});
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  clearPendingAdTab(tabId);
+});
 
 chrome.runtime.onInstalled.addListener(async (details: chrome.runtime.InstalledDetails) => {
   console.log('[SenseAI] Extension installed:', details.reason);
